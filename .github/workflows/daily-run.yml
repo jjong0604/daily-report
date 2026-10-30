@@ -1,25 +1,381 @@
-name: Daily Report
-
+name: daily-briefing
 on:
   schedule:
-    - cron: "0 6 * * *"
+    - cron: "0 22 * * 0-4"      # 한국시간 월~금 07:00 — 일봉 계산(매수 타점)
+    - cron: "30 22 * * 0-4"     # 한국시간 월~금 07:30 — 간밤 미국 시장 브리핑
+    - cron: "*/10 0-6 * * 1-5"  # 한국시간 월~금 09:00~15:59 — 현재가 갱신
   workflow_dispatch:
-
+permissions:
+  contents: write
+concurrency:
+  group: briefing
+  cancel-in-progress: false
 jobs:
-  build-and-start:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 18.x
-      - run: npm install
-      - run: npm run build
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install yfinance pandas
+      - name: 일봉 계산 (진입·손절·익절 가격)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 22 * * 0-4'
+        continue-on-error: true
+        run: |
+          cat > screener.py <<'PYEOF'
+          import json, datetime, time
+          import pandas as pd
+          import yfinance as yf
 
-      - run: npm run start
+          # 후보 종목: 이름 -> (야후 코드, 섹터).  코스피=.KS, 코스닥=.KQ  (여기만 고치면 종목 변경 가능)
+          CAND = {
+           "LS ELECTRIC": ("010120.KS", "전력"), "효성중공업": ("298040.KS", "전력"),
+           "HD현대일렉트릭": ("267260.KS", "전력"), "산일전기": ("062040.KS", "전력"),
+           "SK하이닉스": ("000660.KS", "반도체"), "삼성전자": ("005930.KS", "반도체"),
+           "한미반도체": ("042700.KS", "반도체"), "리노공업": ("058470.KQ", "반도체"),
+           "대한광통신": ("010170.KS", "광통신"), "광전자": ("017900.KS", "광통신"),
+           "빛과전자": ("069540.KQ", "광통신"),
+          }
+          BENCH = "^KS11"
+          try:
+              yf.set_tz_cache_location("/tmp/yfcache")  # 'database is locked' 방지
+          except Exception:
+              pass
+
+          def screen_one(df, bench_r6):
+              c, h, l, v = df["Close"], df["High"], df["Low"], df["Volume"]
+              ma50, ma150, ma200 = (c.rolling(n).mean() for n in (50, 150, 200))
+              px = float(c.iloc[-1]); hi52 = float(h.tail(252).max()); lo52 = float(l.tail(252).min())
+              r6 = px / float(c.iloc[-126]) - 1
+              chk = [px > ma150.iloc[-1] and px > ma200.iloc[-1],
+                     ma150.iloc[-1] > ma200.iloc[-1],
+                     ma200.iloc[-1] > ma200.iloc[-22],
+                     ma50.iloc[-1] > ma150.iloc[-1] and ma50.iloc[-1] > ma200.iloc[-1],
+                     px > ma50.iloc[-1],
+                     px >= lo52 * 1.3,
+                     px >= hi52 * 0.75,
+                     r6 > bench_r6]
+              n = int(sum(bool(x) for x in chk))
+              pivot = float(h.iloc[-21:-1].max())
+              rng10 = h.tail(10).max() / l.tail(10).min() - 1
+              rng_prev = h.iloc[-30:-10].max() / l.iloc[-30:-10].min() - 1
+              tight = bool(rng10 < 0.6 * rng_prev)
+              dry = bool(v.tail(10).mean() < v.tail(50).mean())
+              volx = float(v.iloc[-1] / v.iloc[-51:-1].mean())
+              dist = px / pivot - 1
+              near50 = abs(px / float(ma50.iloc[-1]) - 1) <= 0.03
+              if n < 8:
+                  st, tone = f"관망 (추세 {n}/8)", "x"
+              elif px > pivot * 1.05:
+                  st, tone = f"추격 금지 (피벗 +{dist*100:.1f}%)", "late"
+              elif px >= pivot and volx >= 1.4:
+                  st, tone = "돌파 확인 — 매수 구간", "buy"
+              elif px >= pivot:
+                  st, tone = "돌파했지만 거래량 부족 — 대기", "wait"
+              elif dist >= -0.05 and tight and dry:
+                  st, tone = "대기 — 피벗 돌파 시 매수 (VCP 형성)", "ready"
+              elif near50:
+                  st, tone = "50일선 눌림 — 관찰", "watch"
+              else:
+                  st, tone = "추세 양호 — 베이스 형성 중", "watch"
+              entry = px if tone == "buy" else pivot * 1.001
+              return dict(price=round(px), trend=n, status=st, tone=tone, pivot=round(pivot),
+                          buy_hi=round(pivot * 1.05), stop=round(entry * 0.93), target=round(entry * 1.20),
+                          volx=round(volx, 2), dist=round(dist * 100, 1))
+
+          def get(code):
+              for _ in range(3):
+                  try:
+                      d = yf.download(code, period="2y", auto_adjust=True, progress=False, threads=False)
+                      if isinstance(d.columns, pd.MultiIndex):
+                          d.columns = d.columns.get_level_values(0)
+                      d = d.dropna()
+                      if len(d) > 0:
+                          return d
+                  except Exception as e:
+                      print("retry", code, e)
+                  time.sleep(2)
+              return None
+
+          def run():
+              b = get(BENCH)
+              if b is not None and len(b) > 200:
+                  bench_r6 = float(b["Close"].iloc[-1] / b["Close"].iloc[-126] - 1)
+                  ma50 = b["Close"].rolling(50).mean(); ma200 = b["Close"].rolling(200).mean()
+                  mkt_ok = bool(b["Close"].iloc[-1] > ma50.iloc[-1] and ma50.iloc[-1] > ma200.iloc[-1])
+                  kospi = round(float(b["Close"].iloc[-1]), 2)
+              else:
+                  bench_r6, mkt_ok, kospi = 0.0, False, None
+              rows, failed = [], []
+              for name, (code, sec) in CAND.items():
+                  d = get(code)
+                  if d is None or len(d) < 260:
+                      failed.append(name); print("skip", name, code); continue
+                  try:
+                      r = screen_one(d, bench_r6); r.update(name=name, sector=sec, code=code); rows.append(r)
+                  except Exception as e:
+                      failed.append(name); print("skip", name, e)
+              order = {"buy": 0, "ready": 1, "wait": 2, "watch": 3, "late": 4, "x": 5}
+              rows.sort(key=lambda r: (order[r["tone"]], -r["trend"]))
+              kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+              return dict(generated=kst.strftime("%Y-%m-%d %H:%M"), market_ok=mkt_ok, kospi=kospi,
+                          failed=failed, rows=rows)
+
+          INDEX_HTML = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <meta name="apple-mobile-web-app-capable" content="yes"><title>매수 타점 · 가격 사다리</title>
+          <style>
+          *{box-sizing:border-box}body{margin:0;background:#EEF1F5;color:#0B1B33;font:15px/1.5 -apple-system,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+          main{max-width:560px;margin:0 auto;padding:16px 14px 40px;display:flex;flex-direction:column;gap:12px}
+          h1{margin:4px 2px 0;font-size:21px;font-weight:900}.s{font-size:12px;color:#475467}
+          .m{background:#fff;border-radius:12px;padding:10px 14px;font-size:14px;font-weight:700}
+          .lg{display:flex;gap:12px;flex-wrap:wrap;font-size:11px;color:#475467}.lg i{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:4px}
+          .c{background:#fff;border-radius:16px;padding:14px;display:flex;flex-direction:column;gap:8px}
+          .t{display:flex;justify-content:space-between;align-items:center;font-size:17px;font-weight:700}.ch{font-size:12px;font-weight:700;padding:3px 10px;border-radius:99px}
+          .ac{font-size:13px;font-weight:700;line-height:1.4;padding:8px 10px;border-radius:10px}
+          .ld{position:relative;display:flex;flex-direction:column;gap:2px}.ld:before{content:"";position:absolute;left:8px;top:10px;bottom:10px;width:2px;background:#D5DCE6}
+          .rw{position:relative;display:grid;grid-template-columns:18px 1fr auto 74px;gap:6px;align-items:center;height:30px;font-size:13px;padding:0 6px;border-radius:8px}
+          .rw i{width:10px;height:10px;border-radius:50%;border:2px solid #fff;box-sizing:content-box;margin-left:1px}.rw b{font-size:14px}.rw em{font-style:normal;text-align:right;font-size:12px;color:#475467}
+          .now{background:#0B1B33;color:#fff}.now em{color:#D0D5DD}.now i{background:#fff!important;border-color:#0B1B33}
+          .ft{display:flex;justify-content:space-between;font-size:12px;color:#475467;padding-top:4px;border-top:1px solid #EAECF0}
+          footer{color:#475467;font-size:11.5px;line-height:1.6;margin-top:8px}
+          </style></head><body><main><h1>가격 사다리</h1><div class="s"><a href="us.html">🇺🇸 간밤 미국 시장 브리핑 보기 →</a></div><div class="s" id="sub">불러오는 중…</div><div id="a"></div>
+          <footer><b>적용 기법</b> 마크 미너비니 SEPA — 트렌드 템플릿 8조건을 모두 통과한 종목만, 수축하는 눌림 뒤 <b>피벗 돌파 + 거래량 평소 1.4배↑</b>에서 매수, 피벗 +5% 초과는 추격 금지, 손절 -7%, +20% 부근 일부 익절. 익절·추격선·손절은 모두 진입 트리거 기준 비율입니다.<br>
+          현재가는 키움 REST API로 장중 약 10분마다 갱신되며 몇 분 늦을 수 있습니다. 일봉 지표는 무료 시세라 오차가 있을 수 있으니 주문 전 차트를 직접 확인하세요. 개인 참고용이며 매수 권유가 아닙니다. 투자 판단과 책임은 본인에게 있습니다.</footer></main>
+          <script>
+          const f=n=>Math.round(n).toLocaleString("ko-KR");
+          const COL={tgt:"#12B76A",hi:"#F79009",trg:"#2E90FA",stp:"#D92D20"};
+          function state(r,p){
+           if(r.trend<8)return["관망","#EAECF0","#344054","#F2F4F7","추세 "+r.trend+"/8 — 8조건을 채우기 전까지는 진입 계획만 참고하세요"];
+           if(p>r.buy_hi)return["추격 금지","#FEE4E2","#B42318","#FEF3F2",f(r.buy_hi)+" 초과 — 이미 많이 올랐습니다. 다음 눌림을 기다립니다"];
+           if(p>=r.pivot)return["매수 구간","#D1FADF","#067647","#ECFDF3",f(r.pivot)+"~"+f(r.buy_hi)+" 안에서만 · 거래량 평소 1.4배↑ 확인 · 손절 "+f(r.stop)];
+           if(p>=r.pivot*0.98)return["대기 임박","#D1E9FF","#175CD3","#EFF8FF",f(r.pivot)+" 돌파와 거래량을 확인하세요"];
+           return["대기","#EAECF0","#344054","#F2F4F7",f(r.pivot)+" 돌파 전까지 대기"];
+          }
+          function card(r,p){
+           const [st,cbg,cfg,abg,act]=state(r,p);
+           const gap=p<r.pivot?"진입까지 +"+((r.pivot/p-1)*100).toFixed(1)+"%":"트리거 위 +"+((p/r.pivot-1)*100).toFixed(1)+"%";
+           const L=[{k:"tgt",l:"익절 1차",v:r.target,e:"+20%"},{k:"hi",l:"추격 금지선",v:r.buy_hi,e:"+5%"},{k:"trg",l:"진입 트리거",v:r.pivot,e:"기준"},{k:"stp",l:"손절 (진입 후)",v:r.stop,e:"-7%"},{k:"cur",l:"현재가",v:p,e:gap}].sort((a,b)=>b.v-a.v);
+           const rows=L.map(x=>x.k=="cur"?`<div class="rw now"><i style="background:#fff"></i><span>현재가</span><b>${f(x.v)}</b><em>${x.e}</em></div>`:`<div class="rw"><i style="background:${COL[x.k]}"></i><span>${x.l}</span><b>${f(x.v)}</b><em>${x.e}</em></div>`).join("");
+           return `<div class="c"><div class="t"><span>${r.name} <span class="s">${r.sector}</span></span><span class="ch" style="background:${cbg};color:${cfg}">${st}</span></div>
+           <div class="ac" style="background:${abg};color:${cfg}">${act}</div><div class="ld">${rows}</div>
+           <div class="ft"><span>손익비 2.9 : 1</span><span>추세 ${r.trend}/8 · 거래량 ${r.volx}배(일봉)</span></div></div>`;
+          }
+          (async()=>{try{
+           const d=await (await fetch("data.json?"+Date.now())).json();
+           let live=null;try{const l=await (await fetch("live.json?"+Date.now())).json();if(l.updated&&l.updated.slice(0,10)>=d.generated.slice(0,10))live=l;}catch(e){}
+           document.getElementById("sub").textContent="일봉 계산 "+d.generated+(live?" · 현재가 "+live.updated.slice(5,16)+" 기준":" · 현재가는 일봉 종가");
+           let h=!d.kospi?`<div class="m">⚪ 코스피 데이터를 받지 못해 시장 필터는 판단하지 않았습니다</div>`:`<div class="m" style="color:${d.market_ok?"#067647":"#B42318"}">${d.market_ok?"시장 필터 통과 — 코스피 "+f(d.kospi)+"가 50일선 위":"시장 필터 미통과 — 코스피가 추세 아래입니다. 신규 매수는 쉬어가세요"}</div>`;
+           h+=`<div class="lg"><span><i style="background:#12B76A"></i>익절</span><span><i style="background:#F79009"></i>추격 금지선</span><span><i style="background:#2E90FA"></i>진입 트리거</span><span><i style="background:#D92D20"></i>손절</span><span><i style="background:#0B1B33"></i>현재가</span></div>`;
+           if(d.failed&&d.failed.length)h+=`<div class="m">⚠ 시세를 받지 못한 종목: ${d.failed.join(", ")}</div>`;
+           h+=d.rows.map(r=>card(r,(live&&live.prices&&live.prices[r.name])?live.prices[r.name].price:r.price)).join("");
+           document.getElementById("a").style.cssText="display:flex;flex-direction:column;gap:12px";document.getElementById("a").innerHTML=h;
+          }catch(e){document.getElementById("a").textContent="데이터를 불러오지 못했습니다."}})();
+          </script></body></html>"""
+
+          if __name__ == "__main__":
+              d = run()
+              json.dump(d, open("data.json", "w", encoding="utf-8"), ensure_ascii=False, indent=1)
+              open("index.html", "w", encoding="utf-8").write(INDEX_HTML)
+          PYEOF
+          python screener.py
+      - name: 간밤 미국 시장 브리핑
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '30 22 * * 0-4'
+        continue-on-error: true
         env:
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GOOGLE_PROJECT_ID: ${{ secrets.GOOGLE_PROJECT_ID }}
-          TELEGRAM_API_KEY: ${{ secrets.TELEGRAM_API_KEY }}
-          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          cat > us_briefing.py <<'PYEOF'
+          import json, os, time, datetime, urllib.request
+          import pandas as pd
+          import yfinance as yf
+          try:
+              yf.set_tz_cache_location("/tmp/yfcache")
+          except Exception:
+              pass
+
+          IDX = [("🇰🇷 코스피","^KS11",2),("🇰🇷 코스닥","^KQ11",2),("🇰🇷 원/달러","KRW=X",2),("필라델피아 반도체","^SOX",2),
+           ("나스닥 100","^NDX",2),("나스닥 종합","^IXIC",2),("S&P 500","^GSPC",2),("다우존스","^DJI",2),("러셀2000","^RUT",2),
+           ("VIX","^VIX",2),("미 10년물 금리(%)","^TNX",3),("SK하이닉스 ADR","SKHY",2),("메타","META",2),("WTI 원유","CL=F",2)]
+          SEC = [("전력 인프라",["VRT","PWR","ETN","GEV","NEE"],"전력설비·변압기·전선"),("반도체",["SKHY","MU","ARM","AVGO","NVDA","TER"],"반도체(HBM·장비)"),
+           ("광통신",["LITE","GLW","COHR","ANET"],"광통신 부품"),("수소",["BE","PLUG","FCEL"],"수소연료전지"),
+           ("AI SW",["ORCL","IREN","MSFT","AAPL","PLTR","META"],"AI 플랫폼·SW"),("원전 대형",["CCJ"],"원자력발전(대형)"),
+           ("조선·해운",["FRO","SBLK"],"조선·해운"),("로봇",["KITT","SERV","SYM","ISRG","ARBE"],"지능형로봇"),
+           ("바이오",["AMGN","LLY","NVO"],"제약·바이오"),("방산",["LHX","HII"],"방위산업"),
+           ("우주항공",["RDW","RKLB","LUNR","PL"],"우주항공·위성"),("스테이블코인",["PYPL","COIN","CRCL","HOOD"],"전자결제·가상자산"),
+           ("원전 SMR",["SMR","OKLO"],"SMR"),("2차전지",["QS","TSLA","ALB"],"2차전지"),("양자",["QUBT","RGTI","IONQ","QBTS"],"양자컴퓨터"),
+           ("사이버보안",["CRWD","DDOG","PANW","FTNT"],"정보보안"),("태양광",["FSLR","ENPH"],"태양광에너지")]
+
+          def get(code):
+              for _ in range(3):
+                  try:
+                      d = yf.download(code, period="10d", auto_adjust=True, progress=False, threads=False)
+                      if isinstance(d.columns, pd.MultiIndex):
+                          d.columns = d.columns.get_level_values(0)
+                      c = d["Close"].dropna()
+                      if len(c) >= 2:
+                          return float(c.iloc[-1]), float(c.iloc[-2]), c.index[-1].strftime("%m/%d")
+                  except Exception as e:
+                      print("retry", code, e)
+                  time.sleep(2)
+              return None
+
+          AH_LIST = ["GOOGL","AMZN","MSFT","META","AAPL","NVDA","TSLA","INTC","SNDK","MU","AVGO","AMD","ORCL","COIN"]
+
+          def ah_change(code):
+              for _ in range(2):
+                  try:
+                      d = yf.download(code, period="2d", interval="5m", prepost=True, auto_adjust=False, progress=False, threads=False)
+                      if isinstance(d.columns, pd.MultiIndex):
+                          d.columns = d.columns.get_level_values(0)
+                      c = d["Close"].dropna()
+                      ix = c.index.tz_convert("America/New_York")
+                      day = ix[-1].date()
+                      reg = c[(ix.date == day) & (ix.hour < 16)]
+                      post = c[(ix.date == day) & (ix.hour >= 16)]
+                      if len(reg) and len(post):
+                          return {"t": code, "close": round(float(reg.iloc[-1]), 2), "ah": round(float(post.iloc[-1]), 2),
+                                  "pct": round((float(post.iloc[-1]) / float(reg.iloc[-1]) - 1) * 100, 2),
+                                  "time": post.index.tz_convert("Asia/Seoul")[-1].strftime("%H:%M")}
+                      return None
+                  except Exception as e:
+                      print("ah retry", code, e)
+                  time.sleep(2)
+              return None
+
+          def ai_cards(payload):
+              key = os.environ.get("ANTHROPIC_API_KEY")
+              if not key:
+                  return []
+              prompt = ("한국 투자자가 장 시작 전에 읽을 '간밤 미국 시장 브리핑' 해설 카드를 만드세요. 아래는 직전 거래일 종가 수치입니다. "
+                        "웹 검색으로 간밤 주요 실적·FOMC·이벤트와 수치 변동의 원인을 확인하고, 확인된 사실만 쓰세요. 추측이나 지어낸 수치는 금지. "
+                        "출력은 JSON 배열만(설명·코드블록 금지): [{\"tone\":\"green|red|purple|amber|blue\",\"title\":\"제목\",\"body\":\"2~3문장\"}] 4~6개. "
+                        "카드 주제: 간밤 핵심 요약, 오늘 한국장 최대 변수, 한국 연동 업종 영향, 장중 체크포인트. 한국어.\n\n"
+                        + json.dumps(payload, ensure_ascii=False))
+              body = {"model": "claude-sonnet-5-5", "max_tokens": 3000,
+                      "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 6}],
+                      "messages": [{"role": "user", "content": prompt}]}
+              req = urllib.request.Request("https://api.anthropic.com/v1/messages", data=json.dumps(body).encode(),
+                  headers={"x-api-key": key, "anthropic-version": "2023-06-01", "content-type": "application/json"})
+              try:
+                  r = json.load(urllib.request.urlopen(req, timeout=240))
+                  txt = "".join(b.get("text", "") for b in r["content"] if b.get("type") == "text")
+                  return json.loads(txt[txt.index("["):txt.rindex("]") + 1])
+              except Exception as e:
+                  print("AI 해설 실패:", e)
+                  return []
+
+          def main():
+              out = {"indices": [], "sectors": [], "ah": []}
+              for name, code, dec in IDX:
+                  r = get(code)
+                  if r:
+                      row = {"name": name, "value": round(r[0], dec), "pct": round((r[0]/r[1]-1)*100, 2), "asof": r[2]}
+                      if code == "^TNX":
+                          row["pct"] = None; row["bp"] = round((r[0]-r[1])*100, 1)
+                      out["indices"].append(row)
+              for name, ts, kr in SEC:
+                  ms = []
+                  for t in ts:
+                      r = get(t)
+                      if r: ms.append({"t": t, "pct": round((r[0]/r[1]-1)*100, 2)})
+                  if ms:
+                      ms.sort(key=lambda m: -m["pct"])
+                      out["sectors"].append({"name": name, "kr": kr, "members": ms, "pct": round(sum(m["pct"] for m in ms)/len(ms), 2)})
+              out["sectors"].sort(key=lambda s: -s["pct"])
+              out["ah"] = sorted([r for r in (ah_change(t) for t in AH_LIST) if r], key=lambda r: -abs(r["pct"]))
+              kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+              out["generated"] = kst.strftime("%Y-%m-%d %H:%M")
+              out["cards"] = ai_cards({"after_hours": out["ah"], "indices": out["indices"], "sectors": [{"name": s["name"], "pct": s["pct"], "members": s["members"]} for s in out["sectors"]]})
+              open("us.html", "w", encoding="utf-8").write(PAGE.replace("__DATA__", json.dumps(out, ensure_ascii=False)))
+              print("us.html 생성:", len(out["indices"]), "지수,", len(out["sectors"]), "섹터,", len(out["cards"]), "해설")
+
+          PAGE = """<!doctype html><html lang="ko"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>미국 시장 브리핑</title>
+          <style>
+          :root{--bg:#f6f4ef;--card:#fff;--ink:#1d1d1b;--mute:#76736b;--line:#ebe8e1;--up:#0a7a2f;--dn:#c4161c;--upbg:#eef7e8;--dnbg:#fbeeee}
+          @media(prefers-color-scheme:dark){:root{--bg:#141412;--card:#1e1e1b;--ink:#ecebe6;--mute:#9a978e;--line:#2e2d29;--up:#4cc26f;--dn:#ff7070;--upbg:#172a1b;--dnbg:#301b1b}}
+          *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.55 -apple-system,"Apple SD Gothic Neo","Malgun Gothic","Noto Sans KR",sans-serif;padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom)}
+          main{max-width:880px;margin:0 auto;padding:14px 12px 36px}h1{font-size:22px;margin:6px 4px 2px}.sub{color:var(--mute);font-size:12.5px;margin:0 4px}a{color:inherit}
+          h2{font-size:13.5px;color:var(--mute);margin:22px 4px 8px;font-weight:600}.box{background:var(--card);border:1px solid var(--line);border-radius:12px;overflow:hidden}
+          .row{display:flex;align-items:center;gap:10px;padding:9px 14px;border-bottom:1px solid var(--line)}.row:last-child{border:0}.n{flex:1;min-width:0}.v{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+          .s{display:block;color:var(--mute);font-size:11.5px;line-height:1.45}.rk{width:18px;color:var(--mute);font-size:12px}.up{color:var(--up)}.dn{color:var(--dn)}.top{background:var(--upbg)}.bot{background:var(--dnbg)}
+          .card{background:var(--card);border:1px solid var(--line);border-left:5px solid var(--c);border-radius:12px;padding:12px 14px;margin:10px 0}.card b{display:block;margin-bottom:4px}.card p{margin:3px 0;font-size:14px}
+          .green{--c:#2e9d4f}.red{--c:#d63a3a}.purple{--c:#7a5cc7}.amber{--c:#e0a100}.blue{--c:#3b7dd8}footer{color:var(--mute);font-size:11.5px;text-align:center;margin-top:26px}
+          </style></head><body><main><h1>🇺🇸 미국 시장 브리핑</h1><p class="sub" id="sub"></p><p class="sub"><a href="index.html">← 가격 사다리(매수 타점) 보기</a></p><div id="a"></div>
+          <footer>무료 시세 기준(지연·오차 가능). 개인 참고용이며 매수 권유가 아닙니다. 투자 판단과 책임은 본인에게 있습니다.</footer></main>
+          <script>
+          const D=__DATA__;
+          const esc=s=>String(s).replace(/[&<>]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;"}[c]));
+          const cls=p=>p>0?"up":p<0?"dn":"";const f=v=>v.toLocaleString("ko-KR",{maximumFractionDigits:3});
+          const pc=p=>(p>0?"▲ +":p<0?"▼ ":"")+p.toFixed(2)+"%";
+          document.getElementById("sub").textContent="한국시간 "+D.generated+" 생성 · 각 항목의 직전 거래일 종가";
+          let h=D.ah&&D.ah.length?'<h2>🌙 애프터마켓 (정규장 마감 대비 · 마지막 체결 한국시간 '+D.ah[0].time+')</h2><div class="box">'+D.ah.map(r=>`<div class="row"><div class="n"><b>${r.t}</b><span class="s">정규장 ${f(r.close)} → 시간외 ${f(r.ah)}</span></div><div class="v ${cls(r.pct)}" style="min-width:84px">${pc(r.pct)}</div></div>`).join("")+'</div><p class="sub">거래가 얇은 시간외 가격이라 실제와 다를 수 있습니다. 실적 발표 종목은 해설 카드를 참고하세요.</p>':"";
+          h+='<h2>📊 지수 · 환율</h2><div class="box">'+D.indices.map(i=>{
+           const ch=i.pct===null?(i.bp>0?"▲ +":"▼ ")+Math.abs(i.bp)+"bp":pc(i.pct);const c=i.pct===null?cls(i.bp):cls(i.pct);
+           return `<div class="row"><div class="n"><b>${esc(i.name)}</b><span class="s">${i.asof}</span></div><div class="v">${f(i.value)}</div><div class="v ${c}" style="min-width:84px">${ch}</div></div>`}).join("")+"</div>";
+          const n=D.sectors.length;
+          h+=`<h2>🏆 섹터 등락 순위 — ${n}개 (종목 단순평균)</h2><div class="box">`+D.sectors.map((s,k)=>`<div class="row ${k<3?"top":k>=n-3?"bot":""}"><span class="rk">${k+1}</span><div class="n"><b>${esc(s.name)}</b><span class="s">${s.members.map(m=>m.t+" "+(m.pct>0?"+":"")+m.pct.toFixed(2)).join(" · ")}</span><span class="s">🇰🇷 ${esc(s.kr)}</span></div><div class="v ${cls(s.pct)}"><b>${s.pct>0?"+":""}${s.pct.toFixed(2)}%</b></div></div>`).join("")+"</div>";
+          h+=(D.cards.length?"<h2>📝 해설</h2>":"")+D.cards.map(c=>`<div class="card ${esc(c.tone||"blue")}"><b>${esc(c.title)}</b><p>${esc(c.body)}</p></div>`).join("");
+          document.getElementById("a").innerHTML=h;
+          </script></body></html>"""
+
+          if __name__ == "__main__":
+              main()
+          PYEOF
+          python us_briefing.py
+      - name: 현재가 갱신 (키움 REST API)
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '*/10 0-6 * * 1-5'
+        continue-on-error: true
+        env:
+          KIWOOM_APP_KEY: ${{ secrets.KIWOOM_APP_KEY }}
+          KIWOOM_APP_SECRET: ${{ secrets.KIWOOM_APP_SECRET }}
+        run: |
+          cat > live.py <<'PYEOF'
+          import json, os, time, datetime, urllib.request, urllib.error
+          BASE = "https://api.kiwoom.com"
+          JH = {"Content-Type": "application/json;charset=UTF-8"}
+
+          def post(path, body, headers):
+              req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(), headers=headers, method="POST")
+              with urllib.request.urlopen(req, timeout=20) as r:
+                  return json.load(r)
+
+          def main():
+              key, sec = os.environ.get("KIWOOM_APP_KEY"), os.environ.get("KIWOOM_APP_SECRET")
+              if not key or not sec:
+                  print("KIWOOM 키가 등록되지 않았습니다 — 현재가 갱신을 건너뜁니다"); return
+              j = post("/oauth2/token", {"grant_type": "client_credentials", "appkey": key, "secretkey": sec}, JH)
+              tok = j.get("token")
+              if not tok:
+                  print("토큰 발급 실패:", j.get("return_code"), j.get("return_msg")); raise SystemExit(1)
+              rows = json.load(open("data.json", encoding="utf-8"))["rows"]
+              prices = {}
+              for r in rows:
+                  code = r["code"].split(".")[0]
+                  try:
+                      j = post("/api/dostk/stkinfo", {"stk_cd": code},
+                               {**JH, "authorization": "Bearer " + tok, "api-id": "ka10001"})
+                      cur = str(j.get("cur_prc", "")).replace(",", "").lstrip("+-")
+                      if cur.isdigit():
+                          prices[r["name"]] = {"price": int(cur), "chg": j.get("flu_rt")}
+                      else:
+                          print("현재가 없음:", r["name"], j.get("return_code"), j.get("return_msg"))
+                  except Exception as e:
+                      print("실패:", r["name"], e)
+                  time.sleep(0.4)
+              kst = datetime.datetime.utcnow() + datetime.timedelta(hours=9)
+              json.dump({"updated": kst.strftime("%Y-%m-%d %H:%M"), "prices": prices},
+                        open("live.json", "w", encoding="utf-8"), ensure_ascii=False)
+              print("갱신 완료:", len(prices), "종목")
+
+          main()
+          PYEOF
+          python live.py
+      - name: 저장
+        if: always()
+        run: |
+          git config user.name "briefing-bot"
+          git config user.email "bot@users.noreply.github.com"
+          for f in index.html data.json live.json us.html; do [ -f "$f" ] && git add "$f"; done
+          git diff --staged --quiet || (git commit -m "update" && git pull --rebase origin main && git push)
